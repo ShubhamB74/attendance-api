@@ -11,6 +11,7 @@ Conventions (see DATA_MODEL.md / openapi.yaml, kept locally):
 """
 import logging
 import os
+import re
 from contextlib import asynccontextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
@@ -19,7 +20,7 @@ from typing import Annotated, Literal, Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import AfterValidator, BaseModel, Field, model_validator
-from pymongo import ASCENDING, DESCENDING, MongoClient
+from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError, PyMongoError
 
 load_dotenv()  # override=False by default: real environment variables take priority
@@ -146,6 +147,63 @@ def derive_fields(emp: dict, status: str, att_date: str,
     return fields
 
 
+class RuleViolation(Exception):
+    """A business-rule failure; endpoints turn it into a 422."""
+
+
+def check_punch_pair(punch_in: datetime, punch_out: datetime) -> None:
+    """punch_out must be after punch_in and at most 24 hours later."""
+    if punch_out <= punch_in:
+        raise RuleViolation("punch_out must be after punch_in")
+    if punch_out - punch_in > timedelta(hours=24):
+        raise RuleViolation("punch_out must be within 24 hours of punch_in")
+
+
+TRACKED_FIELDS = ("status", "punch_in", "punch_out", "work_hours",
+                  "late_minutes", "overtime_minutes", "half_day")
+
+
+def stored_state(rec: dict) -> dict:
+    """The tracked fields of a stored record, with legacy defaults for missing ones."""
+    return {
+        "status": rec["status"],
+        "punch_in": rec.get("punch_in"),
+        "punch_out": rec.get("punch_out"),
+        "work_hours": rec.get("work_hours"),
+        "late_minutes": rec.get("late_minutes") or 0,
+        "overtime_minutes": rec.get("overtime_minutes") or 0,
+        "half_day": bool(rec.get("half_day", False)),
+    }
+
+
+def plan_regularization(emp: dict, rec: dict, status: Optional[str],
+                        punch_in: Optional[datetime], punch_out: Optional[datetime]) -> tuple[dict, dict]:
+    """Apply a correction to `rec` in memory. Returns (new tracked state, changes for the history entry).
+
+    status / punch_in / punch_out are the supplied values, or None when the client omitted them.
+    """
+    old = stored_state(rec)
+    new_status = status or old["status"]
+    if new_status in PRESENCE_STATUSES:
+        pin = punch_in or old["punch_in"]
+        pout = punch_out or old["punch_out"]
+        if pin is None:
+            raise RuleViolation("a presence status requires a punch_in")
+        if attendance_date(pin, emp["shift_start"], emp["shift_end"]) != rec["date"]:
+            raise RuleViolation("punch_in must stay on the record's attendance date")
+        if pout is not None:
+            check_punch_pair(pin, pout)
+    else:  # ABSENT / LEAVE clear both punch times, so supplying one is contradictory
+        if punch_in is not None or punch_out is not None:
+            raise RuleViolation("punch_in / punch_out cannot be supplied with status ABSENT or LEAVE")
+        pin = pout = None
+    new = {"status": new_status, "punch_in": pin, "punch_out": pout,
+           **derive_fields(emp, new_status, rec["date"], pin, pout)}
+    changes = {f: {"from": old[f], "to": new[f]} for f in TRACKED_FIELDS if old[f] != new[f]}
+    if not changes:
+        raise RuleViolation("the request changes nothing")
+    return new, changes
+
 # --------------------------------------------------------------------------- #
 # Request models and validated types
 # --------------------------------------------------------------------------- #
@@ -189,6 +247,35 @@ class PunchInIn(BaseModel):
     emp_code: str = Field(min_length=1)
     punched_at: Optional[EpochMs] = None
     status: PresenceStatus = "PRESENT"
+
+
+class PunchOutIn(BaseModel):
+    emp_code: str = Field(min_length=1)
+    punched_at: Optional[EpochMs] = None
+
+
+class RegularizeIn(BaseModel):
+    # "= None" means "omitted -> unchanged". Pydantic does not validate defaults, so an explicit
+    # null is still rejected with 422 (the contract does not allow null here).
+    status: Status = None
+    punch_in: EpochMs = None
+    punch_out: EpochMs = None
+    reason: str = Field(min_length=5, max_length=200)
+    regularized_by: str = Field(min_length=1, max_length=50)
+
+
+_DATE_RE = re.compile(DATE_PATTERN, re.ASCII)
+
+
+def require_date(value: str) -> str:
+    """Validate a YYYY-MM-DD path parameter by hand (the route param must be called `date`)."""
+    try:
+        if not _DATE_RE.fullmatch(value):
+            raise ValueError
+        _check_date(value)
+    except ValueError:
+        raise HTTPException(422, "date must be a valid calendar date, YYYY-MM-DD")
+    return value
 
 
 # --------------------------------------------------------------------------- #
@@ -249,6 +336,9 @@ def ensure_indexes() -> None:
     # it also serves per-employee lists/analytics (equality on emp_code, range/sort on date)
     db.attendance_logs.create_index([("emp_code", ASCENDING), ("date", ASCENDING)],
                                     unique=True, name="uq_emp_code_date")
+    # punch-out: latest record of an employee with punch_in <= t
+    db.attendance_logs.create_index([("emp_code", ASCENDING), ("punch_in", DESCENDING)],
+                                    name="emp_code_punch_in_desc")
     # global list: sort "date desc, emp_code asc" with optional date range
     db.attendance_logs.create_index([("date", DESCENDING), ("emp_code", ASCENDING)], name="date_desc_emp_code")
     # list filtered by status, same sort
@@ -335,6 +425,39 @@ def punch_in(body: PunchInIn):
     return serialize_record(doc)
 
 
+@app.post("/attendance/punch-out")
+def punch_out(body: PunchOutIn):
+    emp = db.employees.find_one({"emp_code": body.emp_code}, {"_id": 0})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    ts = ms_to_dt(body.punched_at) if body.punched_at is not None else now_utc()
+    # the employee's most recent record whose punch_in is at or before the punch-out (works across midnight)
+    rec = db.attendance_logs.find_one(
+        {"emp_code": body.emp_code, "punch_in": {"$lte": ts}},
+        sort=[("punch_in", DESCENDING)],
+    )
+    if rec is None:
+        raise HTTPException(404, "no punch-in found")
+    if rec.get("punch_out") is not None:
+        raise HTTPException(409, "already punched out")
+    try:
+        check_punch_pair(rec["punch_in"], ts)
+    except RuleViolation as exc:
+        raise HTTPException(422, str(exc))
+    derived = derive_fields(emp, rec["status"], rec["date"], rec["punch_in"], ts)
+    # Conditional update: only the request that still sees punch_out == null (and the same punch_in) wins.
+    updated = db.attendance_logs.find_one_and_update(
+        {"_id": rec["_id"], "punch_in": rec["punch_in"], "punch_out": None},
+        {"$set": {"punch_out": ts, "work_hours": derived["work_hours"],
+                  "overtime_minutes": derived["overtime_minutes"], "half_day": derived["half_day"]}},
+        return_document=ReturnDocument.AFTER,
+        projection={"_id": 0},
+    )
+    if updated is None:
+        raise HTTPException(409, "already punched out")
+    return serialize_record(updated)
+
+
 @app.get("/attendance")
 def list_attendance(
     emp_code: Optional[str] = None,
@@ -368,10 +491,51 @@ def list_attendance(
             "total": total, "page": page, "page_size": page_size}
 
 
+MAX_PATCH_ATTEMPTS = 5
+
+
+@app.patch("/attendance/{emp_code}/{date}")
+def regularize_attendance(emp_code: str, date: str, body: RegularizeIn):
+    require_date(date)
+    emp = db.employees.find_one({"emp_code": emp_code}, {"_id": 0})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    supplied_in = ms_to_dt(body.punch_in) if body.punch_in is not None else None
+    supplied_out = ms_to_dt(body.punch_out) if body.punch_out is not None else None
+
+    # Optimistic concurrency: read, plan in memory, write only if the record is still exactly as read.
+    for _ in range(MAX_PATCH_ATTEMPTS):
+        rec = db.attendance_logs.find_one({"emp_code": emp_code, "date": date})
+        if rec is None:
+            raise HTTPException(404, "no attendance record for that date")
+        try:
+            new, changes = plan_regularization(emp, rec, body.status, supplied_in, supplied_out)
+        except RuleViolation as exc:
+            raise HTTPException(422, str(exc))
+        entry = {"at": now_utc(), "by": body.regularized_by, "reason": body.reason, "changes": changes}
+        history = rec.get("history")
+        guard = {
+            "_id": rec["_id"],
+            "status": rec["status"],
+            "punch_in": rec.get("punch_in"),
+            "punch_out": rec.get("punch_out"),
+            # a concurrent correction (or punch-out) changes one of these, so our write would match nothing
+            "history": {"$size": len(history)} if isinstance(history, list) else None,
+        }
+        updated = db.attendance_logs.find_one_and_update(
+            guard,
+            {"$set": new, "$push": {"history": entry}},
+            return_document=ReturnDocument.AFTER,
+            projection={"_id": 0},
+        )
+        if updated is not None:
+            return serialize_record(updated)
+        # somebody changed the record under us: re-read and re-plan (the result may now be 422/404)
+    raise HTTPException(409, "record was modified concurrently, please retry")
+
+
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract:
-#   POST  /attendance/punch-out
-#   PATCH /attendance/{emp_code}/{date}
 #   GET   /analytics/employees/{emp_code}/monthly
 #   GET   /analytics/departments/summary
 #   GET   /analytics/leaderboard/late
