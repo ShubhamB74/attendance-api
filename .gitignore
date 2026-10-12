@@ -1,0 +1,12 @@
+# secrets / local config
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.idea/
+.vscode/
+
+# assignment kit: the problem statement must not be posted publicly before 15 Nov 2026
+kit/
