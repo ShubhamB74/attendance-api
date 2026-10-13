@@ -10,6 +10,7 @@ Conventions (see DATA_MODEL.md / openapi.yaml, kept locally):
   * Derived fields (work_hours, late_minutes, overtime_minutes, half_day) are computed here and stored.
 """
 import calendar
+import json
 import logging
 import os
 import re
@@ -19,6 +20,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from typing import Annotated, Literal, Optional
 
 from dotenv import load_dotenv
+from bson import json_util
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import AfterValidator, BaseModel, Field, model_validator
 from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
@@ -482,15 +484,12 @@ def punch_out(body: PunchOutIn):
     return serialize_record(updated)
 
 
-@app.get("/attendance")
-def list_attendance(
-    emp_code: Optional[str] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    status: Optional[Status] = None,
-    page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
-):
+ATTENDANCE_SORT = [("date", DESCENDING), ("emp_code", ASCENDING)]
+
+
+def build_attendance_filter(emp_code: Optional[str], date_from: Optional[str],
+                            date_to: Optional[str], status: Optional[str]) -> dict:
+    """The one place that turns /attendance query parameters into a MongoDB filter (also used by /admin/explain)."""
     if date_from:
         require_date(date_from)
     if date_to:
@@ -508,10 +507,23 @@ def list_attendance(
             q["date"]["$lte"] = date_to
     if status:
         q["status"] = status
+    return q
+
+
+@app.get("/attendance")
+def list_attendance(
+    emp_code: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status: Optional[Status] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    q = build_attendance_filter(emp_code, date_from, date_to, status)
     total = db.attendance_logs.count_documents(q) if q else db.attendance_logs.estimated_document_count()
     cursor = (
         db.attendance_logs.find(q, {"_id": 0})
-        .sort([("date", DESCENDING), ("emp_code", ASCENDING)])
+        .sort(ATTENDANCE_SORT)
         .skip((page - 1) * page_size)
         .limit(page_size)
     )
@@ -799,16 +811,21 @@ def late_leaderboard(month: str = Query(...), limit: int = Query(10, ge=1, le=50
 MAX_TREND_DAYS = 92
 
 
-@app.get("/analytics/departments/{department}/trend")
-def department_trend(department: str, date_from: str = Query(..., alias="from"),
-                     date_to: str = Query(..., alias="to")):
+def parse_trend_range(date_from: str, date_to: str) -> tuple[date, date]:
     require_date(date_from)
     require_date(date_to)
     start, end = date.fromisoformat(date_from), date.fromisoformat(date_to)
     if end < start:
         raise HTTPException(422, "to must not be before from")
-    if (end - start).days + 1 > MAX_TREND_DAYS:
+    if (end - start).days + 1 > MAX_TREND_DAYS:  # inclusive count: exactly 92 days is allowed
         raise HTTPException(422, f"range must not exceed {MAX_TREND_DAYS} days")
+    return start, end
+
+
+@app.get("/analytics/departments/{department}/trend")
+def department_trend(department: str, date_from: str = Query(..., alias="from"),
+                     date_to: str = Query(..., alias="to")):
+    start, end = parse_trend_range(date_from, date_to)
     if db.employees.find_one({"department": department}, {"_id": 1}) is None:
         raise HTTPException(404, "unknown department")
     rows = list(db.employees.aggregate(department_trend_pipeline(department, start, end)))
@@ -816,6 +833,60 @@ def department_trend(department: str, date_from: str = Query(..., alias="from"),
 
 
 # --------------------------------------------------------------------------- #
-# TODO - the rest of the contract:
-#   GET   /admin/explain/{endpoint}
+# Admin: MongoDB explain (executionStats) of an endpoint's main query / pipeline
 # --------------------------------------------------------------------------- #
+ExplainTarget = Literal["attendance_list", "employee_monthly", "department_summary",
+                        "late_leaderboard", "department_trend"]
+
+
+def _required(value: Optional[str], name: str) -> str:
+    if not value:
+        raise HTTPException(422, f"query parameter '{name}' is required for this endpoint")
+    return value
+
+
+@app.get("/admin/explain/{endpoint}")
+def explain_endpoint(
+    endpoint: ExplainTarget,
+    emp_code: Optional[str] = None,
+    month: Optional[str] = None,
+    department: Optional[str] = None,
+    limit: int = Query(10, ge=1, le=50),
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status: Optional[Status] = None,
+    range_from: Optional[str] = Query(None, alias="from"),
+    range_to: Optional[str] = Query(None, alias="to"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    # Each branch calls the SAME builder the real endpoint uses, so the plan is the real plan.
+    if endpoint == "attendance_list":
+        collection = "attendance_logs"
+        command = {
+            "find": collection,
+            "filter": build_attendance_filter(emp_code, date_from, date_to, status),
+            "projection": {"_id": 0},
+            "sort": dict(ATTENDANCE_SORT),
+            "skip": (page - 1) * page_size,
+            "limit": page_size,
+        }
+    else:
+        if endpoint == "employee_monthly":
+            collection = "attendance_logs"
+            pipeline = employee_monthly_pipeline(_required(emp_code, "emp_code"),
+                                                 require_month(_required(month, "month")))
+        elif endpoint == "department_summary":
+            collection = "employees"
+            pipeline = department_summary_pipeline(require_month(_required(month, "month")), department)
+        elif endpoint == "late_leaderboard":
+            collection = "attendance_logs"
+            pipeline = late_leaderboard_pipeline(require_month(_required(month, "month")), limit, department)
+        else:  # department_trend
+            collection = "employees"
+            start, end = parse_trend_range(_required(range_from, "from"), _required(range_to, "to"))
+            pipeline = department_trend_pipeline(_required(department, "department"), start, end)
+        command = {"aggregate": collection, "pipeline": pipeline, "cursor": {}}
+    result = db.command({"explain": command, "verbosity": "executionStats"})
+    # explain output contains BSON types (dates, Int64, Timestamp): round-trip through extended JSON
+    return {"endpoint": endpoint, "collection": collection, "explain": json.loads(json_util.dumps(result))}
