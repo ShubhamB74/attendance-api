@@ -9,6 +9,7 @@ Conventions (see DATA_MODEL.md / openapi.yaml, kept locally):
   * Calendar dates ("YYYY-MM-DD") and shift times ("HH:MM") are plain strings in IST.
   * Derived fields (work_hours, late_minutes, overtime_minutes, half_day) are computed here and stored.
 """
+import calendar
 import logging
 import os
 import re
@@ -278,6 +279,27 @@ def require_date(value: str) -> str:
     return value
 
 
+_MONTH_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$", re.ASCII)
+
+
+def require_month(value: str) -> str:
+    """Validate a YYYY-MM query parameter by hand."""
+    if not _MONTH_RE.fullmatch(value) or int(value[:4]) < 1:
+        raise HTTPException(422, "month must be YYYY-MM")
+    return value
+
+
+def month_range(month: str) -> tuple[str, str]:
+    """First and last calendar day of 'YYYY-MM' as 'YYYY-MM-DD' strings (string order == date order)."""
+    year, mon = int(month[:4]), int(month[5:7])
+    return f"{year:04d}-{mon:02d}-01", f"{year:04d}-{mon:02d}-{calendar.monthrange(year, mon)[1]:02d}"
+
+
+def count_weekdays(start: date, end: date) -> int:
+    """Mon-Fri days in [start, end] inclusive (R7: no holiday calendar). At most 31 iterations."""
+    return sum(1 for i in range((end - start).days + 1) if (start + timedelta(days=i)).weekday() < 5)
+
+
 # --------------------------------------------------------------------------- #
 # Serialisation: Mongo document -> API JSON (no _id, instants as epoch ms)
 # --------------------------------------------------------------------------- #
@@ -332,6 +354,8 @@ def ensure_indexes() -> None:
     # employees: uniqueness of the business key + department filter sorted by emp_code
     db.employees.create_index([("emp_code", ASCENDING)], unique=True, name="uq_emp_code")
     db.employees.create_index([("department", ASCENDING), ("emp_code", ASCENDING)], name="department_emp_code")
+    # headcount (R9): employees who joined on or before the end of a month, optionally within a department
+    db.employees.create_index([("joined_on", ASCENDING)], name="joined_on")
     # attendance_logs: one record per (emp_code, date) - this is what makes punch-in race-safe;
     # it also serves per-employee lists/analytics (equality on emp_code, range/sort on date)
     db.attendance_logs.create_index([("emp_code", ASCENDING), ("date", ASCENDING)],
@@ -461,12 +485,16 @@ def punch_out(body: PunchOutIn):
 @app.get("/attendance")
 def list_attendance(
     emp_code: Optional[str] = None,
-    date_from: Optional[DateStr] = None,
-    date_to: Optional[DateStr] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
     status: Optional[Status] = None,
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
 ):
+    if date_from:
+        require_date(date_from)
+    if date_to:
+        require_date(date_to)
     if date_from and date_to and date_from > date_to:
         raise HTTPException(422, "date_from must not be after date_to")
     q: dict = {}
@@ -535,9 +563,127 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeIn):
 
 
 # --------------------------------------------------------------------------- #
+# Analytics: aggregation pipelines (built by functions so /admin/explain can reuse them)
+# --------------------------------------------------------------------------- #
+_PRESENCE = list(PRESENCE_STATUSES)
+# `date` is an IST calendar-date string; parsing it as a UTC date gives that calendar date's weekday (1=Mon..7=Sun).
+_WEEKDAY = {"$isoDayOfWeek": {"$dateFromString": {"dateString": "$date", "format": "%Y-%m-%d"}}}
+# Stored derived values are authoritative: read them, never recompute from punch times.
+# Present-day credit of one record: 1 (0.5 for a half day) if presence status and Mon-Fri, else 0 (R5-R7).
+_PRESENT_CREDIT = {"$cond": [
+    {"$and": [{"$in": ["$status", _PRESENCE]}, {"$lte": [_WEEKDAY, 5]}]},
+    {"$cond": [{"$eq": [{"$ifNull": ["$half_day", False]}, True]}, 0.5, 1]},
+    0,
+]}
+
+
+def employee_monthly_pipeline(emp_code: str, month: str) -> list:
+    first, last = month_range(month)
+    return [
+        {"$match": {"emp_code": emp_code, "date": {"$gte": first, "$lte": last}}},  # (emp_code, date) index
+        {"$group": {
+            "_id": None,
+            "present_days": {"$sum": _PRESENT_CREDIT},
+            "leave_days": {"$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}},
+            "late_count": {"$sum": {"$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]}},
+            "total_late_minutes": {"$sum": {"$ifNull": ["$late_minutes", 0]}},
+            "total_overtime_minutes": {"$sum": {"$ifNull": ["$overtime_minutes", 0]}},
+        }},
+    ]
+
+
+def department_summary_pipeline(month: str, department: Optional[str] = None) -> list:
+    """Starts from `employees` (so people with zero logs still count) and joins each one's month of logs."""
+    first, last = month_range(month)
+    emp_match: dict = {"joined_on": {"$lte": last}}  # R9: not-yet-joined employees are excluded
+    if department:
+        emp_match["department"] = department
+    wh_ok = {"$and": [{"$in": ["$logs.status", _PRESENCE]}, {"$isNumber": "$logs.work_hours"}]}
+    return [
+        {"$match": emp_match},
+        {"$lookup": {
+            "from": "attendance_logs",
+            "localField": "emp_code",
+            "foreignField": "emp_code",
+            "pipeline": [
+                {"$match": {"date": {"$gte": first, "$lte": last}}},
+                {"$project": {
+                    "_id": 0,
+                    "status": 1,
+                    "work_hours": 1,
+                    "late": {"$ifNull": ["$late_minutes", 0]},
+                    "credit": _PRESENT_CREDIT,
+                }},
+            ],
+            "as": "logs",
+        }},
+        {"$unwind": {"path": "$logs", "preserveNullAndEmptyArrays": True}},  # keep employees with no logs
+        {"$group": {
+            "_id": "$department",
+            "employees": {"$addToSet": "$emp_code"},  # unwind repeats an employee once per log
+            "present_days": {"$sum": "$logs.credit"},
+            "late_count": {"$sum": {"$cond": [{"$gt": [{"$ifNull": ["$logs.late", 0]}, 0]}, 1, 0]}},
+            "total_late_minutes": {"$sum": {"$ifNull": ["$logs.late", 0]}},
+            "leave_count": {"$sum": {"$cond": [{"$eq": ["$logs.status", "LEAVE"]}, 1, 0]}},
+            "on_duty_count": {"$sum": {"$cond": [{"$eq": ["$logs.status", "ON_DUTY"]}, 1, 0]}},
+            # average over RECORDS: sum and count of work_hours (in whole hundredths, so the sum is exact)
+            "work_cents": {"$sum": {"$cond": [wh_ok, {"$round": [{"$multiply": ["$logs.work_hours", 100]}, 0]}, 0]}},
+            "work_records": {"$sum": {"$cond": [wh_ok, 1, 0]}},
+        }},
+        {"$sort": {"_id": 1}},
+    ]
+
+
+@app.get("/analytics/employees/{emp_code}/monthly")
+def employee_monthly(emp_code: str, month: str = Query(...)):
+    require_month(month)
+    emp = db.employees.find_one({"emp_code": emp_code}, {"_id": 0, "joined_on": 1})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    first, last = month_range(month)
+    # R7: working days are counted from joined_on for a mid-month joiner (0 if not joined yet)
+    start = max(date.fromisoformat(first), date.fromisoformat(emp["joined_on"]))
+    working_days = count_weekdays(start, date.fromisoformat(last))
+    agg = next(iter(db.attendance_logs.aggregate(employee_monthly_pipeline(emp_code, month))), None) or {}
+    present_days = agg.get("present_days", 0)
+    return {
+        "emp_code": emp_code,
+        "month": month,
+        "working_days": working_days,
+        "present_days": round_half_up(present_days, 2),
+        "leave_days": int(agg.get("leave_days", 0)),
+        "late_count": int(agg.get("late_count", 0)),
+        "total_late_minutes": int(agg.get("total_late_minutes", 0)),
+        "total_overtime_minutes": int(agg.get("total_overtime_minutes", 0)),
+        "attendance_pct": (round_half_up(Decimal(str(present_days)) / Decimal(working_days) * 100, 2)
+                           if working_days else None),
+    }
+
+
+@app.get("/analytics/departments/summary")
+def department_summary(month: str = Query(...), department: Optional[str] = None):
+    require_month(month)
+    items = []
+    for row in db.employees.aggregate(department_summary_pipeline(month, department)):
+        records = int(row["work_records"])
+        avg = None
+        if records:  # exact: whole hundredths / records / 100, rounded half-up (R8)
+            avg = round_half_up(Decimal(int(row["work_cents"])) / Decimal(records) / Decimal(100), 2)
+        items.append({
+            "department": row["_id"],
+            "headcount": len(row["employees"]),
+            "present_days": round_half_up(row["present_days"], 2),
+            "avg_work_hours": avg,
+            "late_count": int(row["late_count"]),
+            "total_late_minutes": int(row["total_late_minutes"]),
+            "leave_count": int(row["leave_count"]),
+            "on_duty_count": int(row["on_duty_count"]),
+        })
+    return {"month": month, "items": items}
+
+
+# --------------------------------------------------------------------------- #
 # TODO - the rest of the contract:
-#   GET   /analytics/employees/{emp_code}/monthly
-#   GET   /analytics/departments/summary
 #   GET   /analytics/leaderboard/late
 #   GET   /analytics/departments/{department}/trend
 #   GET   /admin/explain/{endpoint}
