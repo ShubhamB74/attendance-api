@@ -7,7 +7,7 @@ endpoints are MongoDB aggregation pipelines and `GET /admin/explain/{endpoint}` 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env            # MONGO_URI, MONGO_DB (real environment variables take priority)
+cp .env.example .env
 uvicorn app.main:app --port 8000
 ```
 Indexes are created at startup; no manual steps. Interactive docs: http://localhost:8000/docs
